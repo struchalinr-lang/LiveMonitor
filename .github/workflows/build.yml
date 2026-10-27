@@ -1,0 +1,196 @@
+name: Build LiveMonitor APK
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Generate Code
+        run: |
+          mkdir -p app/src/main/java/com/example/livemonitor
+          mkdir -p app/src/main/cpp
+          
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = "LiveMonitor"
+          include(":app")
+          EOF
+          
+          cat << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.2.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          EOF
+          
+          cat << 'EOF' > app/build.gradle.kts
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.example.livemonitor"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.livemonitor"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" } }
+              buildFeatures { compose = true; prefab = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.8" }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.12.0")
+              implementation("androidx.activity:activity-compose:1.8.2")
+              implementation(platform("androidx.compose:compose-bom:2024.02.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("com.google.oboe:oboe:1.9.0")
+          }
+          EOF
+          
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <application android:label="LiveMonitor" android:theme="@android:style/Theme.NoTitleBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          
+          cat << 'EOF' > app/src/main/cpp/CMakeLists.txt
+          cmake_minimum_required(VERSION 3.22.1)
+          project("livemonitor")
+          find_package(oboe REQUIRED CONFIG)
+          add_library(livemonitor SHARED livemonitor.cpp)
+          find_library(log-lib log)
+          target_link_libraries(livemonitor oboe::oboe ${log-lib})
+          EOF
+          
+          cat << 'EOF' > app/src/main/cpp/livemonitor.cpp
+          #include <jni.h>
+          #include <oboe/Oboe.h>
+          #include <android/log.h>
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "LiveMonitor", __VA_ARGS__)
+          
+          class LiveEngine : public oboe::AudioStreamCallback {
+          private:
+              std::shared_ptr<oboe::AudioStream> mRecordingStream;
+              std::shared_ptr<oboe::AudioStream> mPlaybackStream;
+          public:
+              oboe::DataCallbackResult onAudioReady(oboe::AudioStream *audioStream, void *audioData, int32_t numFrames) override {
+                  if (mRecordingStream) {
+                      auto result = mRecordingStream->read(audioData, numFrames, 0);
+                      if (result != oboe::Result::OK) memset(audioData, 0, numFrames * audioStream->getBytesPerFrame());
+                  } else {
+                      memset(audioData, 0, numFrames * audioStream->getBytesPerFrame());
+                  }
+                  return oboe::DataCallbackResult::Continue;
+              }
+              bool start() {
+                  oboe::AudioStreamBuilder inBuilder;
+                  inBuilder.setDirection(oboe::Direction::Input)->setPerformanceMode(oboe::PerformanceMode::LowLatency)
+                          ->setSharingMode(oboe::SharingMode::Exclusive)->setFormat(oboe::AudioFormat::Float)
+                          ->setChannelCount(oboe::ChannelCount::Mono);
+                  if (inBuilder.openStream(mRecordingStream) != oboe::Result::OK) return false;
+                  
+                  oboe::AudioStreamBuilder outBuilder;
+                  outBuilder.setDirection(oboe::Direction::Output)->setPerformanceMode(oboe::PerformanceMode::LowLatency)
+                          ->setSharingMode(oboe::SharingMode::Exclusive)->setFormat(mRecordingStream->getFormat())
+                          ->setChannelCount(mRecordingStream->getChannelCount())->setSampleRate(mRecordingStream->getSampleRate())
+                          ->setCallback(this);
+                  if (outBuilder.openStream(mPlaybackStream) != oboe::Result::OK) return false;
+                  
+                  mRecordingStream->requestStart();
+                  mPlaybackStream->requestStart();
+                  return true;
+              }
+              void stop() {
+                  if (mPlaybackStream) { mPlaybackStream->requestStop(); mPlaybackStream->close(); mPlaybackStream.reset(); }
+                  if (mRecordingStream) { mRecordingStream->requestStop(); mRecordingStream->close(); mRecordingStream.reset(); }
+              }
+          };
+          LiveEngine engine;
+          extern "C" JNIEXPORT jboolean JNICALL Java_com_example_livemonitor_MainActivity_startMonitoring(JNIEnv *env, jobject thiz) { return engine.start(); }
+          extern "C" JNIEXPORT void JNICALL Java_com_example_livemonitor_MainActivity_stopMonitoring(JNIEnv *env, jobject thiz) { engine.stop(); }
+          EOF
+          
+          cat << 'EOF' > app/src/main/java/com/example/livemonitor/MainActivity.kt
+          package com.example.livemonitor
+          import android.Manifest
+          import android.content.pm.PackageManager
+          import android.os.Bundle
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.unit.dp
+          import androidx.core.content.ContextCompat
+          
+          class MainActivity : ComponentActivity() {
+              private external fun startMonitoring(): Boolean
+              private external fun stopMonitoring()
+              companion object { init { System.loadLibrary("livemonitor") } }
+              
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val requestPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
+                      if (!isGranted) Toast.makeText(this, "Нужен микрофон!", Toast.LENGTH_SHORT).show()
+                  }
+                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                  }
+                  
+                  setContent {
+                      var isMonitoring by remember { mutableStateOf(false) }
+                      Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                          Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                              Text(text = if (isMonitoring) "Мониторинг АКТИВЕН" else "Мониторинг ВЫКЛЮЧЕН")
+                              Spacer(modifier = Modifier.height(16.dp))
+                              Button(onClick = {
+                                  if (isMonitoring) {
+                                      stopMonitoring()
+                                      isMonitoring = false
+                                  } else {
+                                      if (startMonitoring()) isMonitoring = true
+                                      else Toast.makeText(this@MainActivity, "Ошибка", Toast.LENGTH_SHORT).show()
+                                  }
+                              }) { Text(if (isMonitoring) "Остановить" else "Запустить") }
+                          }
+                      }
+                  }
+              }
+              override fun onDestroy() { super.onDestroy(); stopMonitoring() }
+          }
+          EOF
+
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+        
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveMonitor-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
