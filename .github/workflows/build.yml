@@ -67,8 +67,8 @@ jobs:
                   applicationId "com.example.livemonitor"
                   minSdk 24
                   targetSdk 34
-                  versionCode 2
-                  versionName "2.0-Pro"
+                  versionCode 3
+                  versionName "3.0-Karaoke"
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_1_8
@@ -86,18 +86,35 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+              <queries>
+                  <package android:name="com.google.android.apps.youtube.music" />
+              </queries>
+
               <application
                   android:label="Vocal Studio Pro"
                   android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
                   <activity
                       android:name=".MainActivity"
                       android:exported="true"
+                      android:launchMode="singleTask"
+                      android:resizeableActivity="true"
                       android:screenOrientation="portrait">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+
+                  <service
+                      android:name=".VocalService"
+                      android:enabled="true"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone" />
               </application>
           </manifest>
           EOF
@@ -128,14 +145,14 @@ jobs:
               std::shared_ptr<oboe::AudioStream> mRecordingStream;
               std::shared_ptr<oboe::AudioStream> mPlaybackStream;
 
-              std::atomic<float> mGain{1.2f};
-              std::atomic<float> mReverbMix{0.25f};
+              std::atomic<float> mGain{1.3f};
+              std::atomic<float> mReverbMix{0.30f};
               std::atomic<float> mHarmonyMix{0.40f};
               std::atomic<int> mHarmonyMode{0};
-              std::atomic<float> mBrightness{0.30f};
+              std::atomic<float> mBrightness{0.35f};
               std::atomic<float> mPeakLevel{0.0f};
+              std::atomic<bool> mMixWithMusic{true};
 
-              // Pitch shifter circular buffer (4096 samples)
               static constexpr int PITCH_BUF_SIZE = 4096;
               static constexpr int PITCH_BUF_MASK = PITCH_BUF_SIZE - 1;
               static constexpr float GRAIN_SIZE = 1024.0f;
@@ -143,10 +160,8 @@ jobs:
               int mPitchWriteIdx = 0;
               float mPitchPhase = 0.0f;
 
-              // High-shelf / Air EQ state
               float mPrevInput = 0.0f;
 
-              // Schroeder Reverb buffers
               std::vector<float> mComb1, mComb2, mComb3, mComb4;
               int mCombIdx1 = 0, mCombIdx2 = 0, mCombIdx3 = 0, mCombIdx4 = 0;
               float mCombStore1 = 0.0f, mCombStore2 = 0.0f, mCombStore3 = 0.0f, mCombStore4 = 0.0f;
@@ -246,7 +261,6 @@ jobs:
                       return oboe::DataCallbackResult::Continue;
                   }
 
-                  // Drain initial backlog during first few callbacks to minimize latency
                   if (mWarmupCallbacks < 6) {
                       float discardBuf[512];
                       while (mRecordingStream->read(discardBuf, 512, 0).value() == 512) {}
@@ -266,22 +280,20 @@ jobs:
                   float bright = mBrightness.load();
 
                   float pitchRatio = 1.0f;
-                  if (harmMode == 1) pitchRatio = 1.008f;      // Chorus / Double track
-                  else if (harmMode == 2) pitchRatio = 1.2599f; // Major 3rd (+4 semitones)
-                  else if (harmMode == 3) pitchRatio = 1.4983f; // Perfect 5th (+7 semitones)
-                  else if (harmMode == 4) pitchRatio = 0.5000f; // Sub-Octave (-12 semitones)
+                  if (harmMode == 1) pitchRatio = 1.008f;
+                  else if (harmMode == 2) pitchRatio = 1.2599f;
+                  else if (harmMode == 3) pitchRatio = 1.4983f;
+                  else if (harmMode == 4) pitchRatio = 0.5000f;
 
                   float maxPeak = 0.0f;
 
                   for (int32_t i = 0; i < numFrames; ++i) {
                       float raw = outputBuffer[i] * gain;
 
-                      // Air / High-frequency crispness filter
                       float highFreq = raw - mPrevInput;
                       mPrevInput = raw;
                       float dry = raw + highFreq * (bright * 0.8f);
 
-                      // Vocal Harmony
                       float harmony = 0.0f;
                       if (harmMode > 0 && harmMix > 0.01f) {
                           harmony = processPitchShift(dry, pitchRatio) * harmMix;
@@ -292,13 +304,11 @@ jobs:
 
                       float combined = dry + harmony;
 
-                      // Studio Reverb
                       float wet = 0.0f;
                       if (revMix > 0.01f) {
                           wet = processReverb(combined, revMix) * revMix;
                       }
 
-                      // Soft limiter (prevents nasty digital clipping in headphones)
                       float finalOut = std::tanh(combined + wet);
                       outputBuffer[i] = finalOut;
 
@@ -317,13 +327,18 @@ jobs:
               }
 
               bool start() {
+                  stop();
                   initDSP();
                   mWarmupCallbacks = 0;
+
+                  // Output uses Shared mode by default so YouTube Music plays simultaneously via Android Fast Mixer
+                  oboe::SharingMode outSharing = mMixWithMusic.load() ? oboe::SharingMode::Shared : oboe::SharingMode::Exclusive;
 
                   oboe::AudioStreamBuilder outBuilder;
                   outBuilder.setDirection(oboe::Direction::Output)
                           ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
-                          ->setSharingMode(oboe::SharingMode::Exclusive)
+                          ->setSharingMode(outSharing)
+                          ->setUsage(oboe::Usage::Media)
                           ->setFormat(oboe::AudioFormat::Float)
                           ->setChannelCount(oboe::ChannelCount::Mono)
                           ->setCallback(this);
@@ -334,6 +349,7 @@ jobs:
 
                   mPlaybackStream->setBufferSizeInFrames(mPlaybackStream->getFramesPerBurst() * 2);
 
+                  // Input keeps Exclusive mode for ultra-low microphone latency
                   oboe::AudioStreamBuilder inBuilder;
                   inBuilder.setDirection(oboe::Direction::Input)
                           ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
@@ -373,6 +389,7 @@ jobs:
               void setHarmonyMix(float val) { mHarmonyMix.store(val); }
               void setHarmonyMode(int mode) { mHarmonyMode.store(mode); }
               void setBrightness(float val) { mBrightness.store(val); }
+              void setMixWithMusic(bool mix) { mMixWithMusic.store(mix); }
               float getPeak() { return mPeakLevel.load(); }
           };
 
@@ -413,9 +430,80 @@ jobs:
               engine.setBrightness(val);
           }
 
+          extern "C" JNIEXPORT void JNICALL
+          Java_com_example_livemonitor_MainActivity_setMixWithMusic(JNIEnv *env, jobject thiz, jboolean mix) {
+              engine.setMixWithMusic(mix);
+          }
+
           extern "C" JNIEXPORT jfloat JNICALL
           Java_com_example_livemonitor_MainActivity_getPeakLevel(JNIEnv *env, jobject thiz) {
               return engine.getPeak();
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/livemonitor/VocalService.java
+          package com.example.livemonitor;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.os.Build;
+          import android.os.IBinder;
+
+          public class VocalService extends Service {
+              private static final String CHANNEL_ID = "VocalStudioChannel";
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  createNotificationChannel();
+
+                  Intent openIntent = new Intent(this, MainActivity.class);
+                  int piFlags = Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0;
+                  PendingIntent pendingIntent = PendingIntent.getActivity(this, 0, openIntent, piFlags);
+
+                  Notification.Builder builder = Build.VERSION.SDK_INT >= 26
+                          ? new Notification.Builder(this, CHANNEL_ID)
+                          : new Notification.Builder(this);
+
+                  Notification notification = builder
+                          .setContentTitle("Vocal Studio Pro активен")
+                          .setContentText("Микрофон работает в фоне поверх YouTube Music")
+                          .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                          .setContentIntent(pendingIntent)
+                          .setOngoing(true)
+                          .build();
+
+                  if (Build.VERSION.SDK_INT >= 30) {
+                      startForeground(101, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);
+                  } else {
+                      startForeground(101, notification);
+                  }
+
+                  return START_STICKY;
+              }
+
+              private void createNotificationChannel() {
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      NotificationChannel channel = new NotificationChannel(
+                              CHANNEL_ID,
+                              "Вокальный мониторинг",
+                              NotificationManager.IMPORTANCE_LOW
+                      );
+                      NotificationManager manager = getSystemService(NotificationManager.class);
+                      if (manager != null) {
+                          manager.createNotificationChannel(channel);
+                      }
+                  }
+              }
+
+              @Override
+              public IBinder onBind(Intent intent) {
+                  return null;
+              }
           }
           EOF
 
@@ -424,17 +512,24 @@ jobs:
 
           import android.Manifest;
           import android.app.Activity;
+          import android.content.Intent;
           import android.content.pm.PackageManager;
           import android.content.res.ColorStateList;
           import android.graphics.Color;
+          import android.graphics.PixelFormat;
           import android.graphics.Typeface;
           import android.graphics.drawable.GradientDrawable;
+          import android.net.Uri;
+          import android.os.Build;
           import android.os.Bundle;
           import android.os.Handler;
           import android.os.Looper;
+          import android.provider.Settings;
           import android.view.Gravity;
+          import android.view.MotionEvent;
           import android.view.View;
           import android.view.Window;
+          import android.view.WindowManager;
           import android.widget.Button;
           import android.widget.HorizontalScrollView;
           import android.widget.LinearLayout;
@@ -456,14 +551,28 @@ jobs:
               private native void setHarmonyMix(float val);
               private native void setHarmonyMode(int mode);
               private native void setBrightness(float val);
+              private native void setMixWithMusic(boolean mix);
               private native float getPeakLevel();
 
               private boolean isMonitoring = false;
               private int selectedHarmony = 0;
+              private int currentReverbPct = 30;
               private Button[] harmonyButtons = new Button[5];
+              private String[] harmonyNames = {"Выкл", "Дабл / Хор", "Терция (+4)", "Квинта (+7)", "Октава (-12)"};
+
               private ProgressBar levelBar;
               private TextView levelValueText;
+              private TextView statusBadge;
+              private Button mainButton;
+              private SeekBar reverbSeekBar;
               private Handler uiHandler = new Handler(Looper.getMainLooper());
+
+              // Floating Overlay Widget
+              private WindowManager windowManager;
+              private View floatingView;
+              private TextView floatHarmText;
+              private TextView floatRevText;
+              private boolean isOverlayExpanded = false;
 
               // Material 3 Dark Colors
               private final int COLOR_BG = Color.parseColor("#0F0D13");
@@ -477,6 +586,7 @@ jobs:
               private final int COLOR_ACTIVE_GREEN = Color.parseColor("#6DD58C");
               private final int COLOR_STOP_RED = Color.parseColor("#F2B8B5");
               private final int COLOR_ON_STOP_RED = Color.parseColor("#601410");
+              private final int COLOR_YT_RED = Color.parseColor("#FF4E45");
 
               private int dp(int value) {
                   return (int) (value * getResources().getDisplayMetrics().density);
@@ -501,7 +611,11 @@ jobs:
                   window.setNavigationBarColor(COLOR_BG);
 
                   if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                      requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1);
+                      if (Build.VERSION.SDK_INT >= 33) {
+                          requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS}, 1);
+                      } else {
+                          requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1);
+                      }
                   }
 
                   ScrollView scrollView = new ScrollView(this);
@@ -510,7 +624,7 @@ jobs:
 
                   LinearLayout root = new LinearLayout(this);
                   root.setOrientation(LinearLayout.VERTICAL);
-                  root.setPadding(dp(20), dp(28), dp(20), dp(32));
+                  root.setPadding(dp(20), dp(24), dp(20), dp(32));
 
                   // --- HEADER SECTION ---
                   LinearLayout headerRow = new LinearLayout(this);
@@ -519,24 +633,23 @@ jobs:
 
                   LinearLayout titleCol = new LinearLayout(this);
                   titleCol.setOrientation(LinearLayout.VERTICAL);
-                  LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-                  titleCol.setLayoutParams(titleParams);
+                  titleCol.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
                   TextView appTitle = new TextView(this);
                   appTitle.setText("Vocal Studio Pro");
                   appTitle.setTextColor(COLOR_TEXT);
-                  appTitle.setTextSize(26f);
+                  appTitle.setTextSize(25f);
                   appTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
 
                   TextView appSub = new TextView(this);
-                  appSub.setText("Oboe C++ • Мониторинг без задержки");
+                  appSub.setText("Oboe C++ • Караоке с YouTube Music");
                   appSub.setTextColor(COLOR_TEXT_MUTED);
                   appSub.setTextSize(13f);
 
                   titleCol.addView(appTitle);
                   titleCol.addView(appSub);
 
-                  final TextView statusBadge = new TextView(this);
+                  statusBadge = new TextView(this);
                   statusBadge.setText("● ОЖИДАНИЕ");
                   statusBadge.setTextColor(COLOR_TEXT_MUTED);
                   statusBadge.setTextSize(12f);
@@ -548,7 +661,40 @@ jobs:
                   headerRow.addView(statusBadge);
                   root.addView(headerRow);
 
-                  addSpacer(root, 20);
+                  addSpacer(root, 18);
+
+                  // --- CARD 0: YOUTUBE MUSIC KARAOKE LAUNCHER ---
+                  LinearLayout ytCard = createCard();
+                  ytCard.setBackground(createRoundedRect(Color.parseColor("#25181C"), 24, COLOR_YT_RED, 1));
+
+                  TextView ytTitle = new TextView(this);
+                  ytTitle.setText("🎵 Режим Караоке с YouTube Music");
+                  ytTitle.setTextColor(Color.WHITE);
+                  ytTitle.setTextSize(16f);
+                  ytTitle.setTypeface(Typeface.DEFAULT_BOLD);
+                  ytCard.addView(ytTitle);
+
+                  TextView ytDesc = new TextView(this);
+                  ytDesc.setText("Запускает фоновый мониторинг голоса, выводит плавающий мини-пульт поверх экрана и открывает YouTube Music с текстами песен.");
+                  ytDesc.setTextColor(COLOR_SECONDARY);
+                  ytDesc.setTextSize(12f);
+                  ytCard.addView(ytDesc);
+
+                  addSpacer(ytCard, 12);
+
+                  Button ytButton = new Button(this);
+                  ytButton.setText("🚀  Петь в YouTube Music (+ Мини-пульт)");
+                  ytButton.setAllCaps(false);
+                  ytButton.setTextSize(14f);
+                  ytButton.setTypeface(Typeface.DEFAULT_BOLD);
+                  ytButton.setTextColor(Color.WHITE);
+                  ytButton.setBackground(createRoundedRect(COLOR_YT_RED, 20, 0, 0));
+                  ytButton.setLayoutParams(new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)));
+                  ytButton.setOnClickListener(v -> launchYouTubeMusicKaraoke());
+                  ytCard.addView(ytButton);
+
+                  root.addView(ytCard);
+                  addSpacer(root, 16);
 
                   // --- CARD 1: LIVE VU METER ---
                   LinearLayout meterCard = createCard();
@@ -572,15 +718,14 @@ jobs:
                   meterHeader.addView(levelValueText);
                   meterCard.addView(meterHeader);
 
-                  addSpacer(meterCard, 12);
+                  addSpacer(meterCard, 10);
 
                   levelBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
                   levelBar.setMax(100);
                   levelBar.setProgress(0);
                   levelBar.setProgressTintList(ColorStateList.valueOf(COLOR_PRIMARY));
                   levelBar.setProgressBackgroundTintList(ColorStateList.valueOf(COLOR_CARD_HIGHLIGHT));
-                  LinearLayout.LayoutParams barParams = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(12));
-                  levelBar.setLayoutParams(barParams);
+                  levelBar.setLayoutParams(new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(12)));
                   meterCard.addView(levelBar);
 
                   root.addView(meterCard);
@@ -595,24 +740,17 @@ jobs:
                   harmTitle.setTypeface(Typeface.DEFAULT_BOLD);
                   harmonyCard.addView(harmTitle);
 
-                  TextView harmSub = new TextView(this);
-                  harmSub.setText("Добавляет второй голос в реальном времени поверх вашего");
-                  harmSub.setTextColor(COLOR_TEXT_MUTED);
-                  harmSub.setTextSize(12f);
-                  harmonyCard.addView(harmSub);
-
-                  addSpacer(harmonyCard, 14);
+                  addSpacer(harmonyCard, 12);
 
                   HorizontalScrollView chipScroll = new HorizontalScrollView(this);
                   chipScroll.setHorizontalScrollBarEnabled(false);
                   LinearLayout chipRow = new LinearLayout(this);
                   chipRow.setOrientation(LinearLayout.HORIZONTAL);
 
-                  String[] modes = {"Выкл", "Дабл / Хор", "Терция (+4)", "Квинта (+7)", "Октава (-12)"};
-                  for (int i = 0; i < modes.length; i++) {
+                  for (int i = 0; i < harmonyNames.length; i++) {
                       final int index = i;
                       Button chip = new Button(this);
-                      chip.setText(modes[i]);
+                      chip.setText(harmonyNames[i]);
                       chip.setAllCaps(false);
                       chip.setTextSize(13f);
                       chip.setPadding(dp(16), dp(8), dp(16), dp(8));
@@ -628,16 +766,16 @@ jobs:
                   harmonyCard.addView(chipScroll);
                   selectHarmonyChip(0);
 
-                  addSpacer(harmonyCard, 16);
+                  addSpacer(harmonyCard, 14);
 
-                  addSlider(harmonyCard, "Громкость гармонии", 40, 100, "%", progress -> {
+                  addSlider(harmonyCard, "Громкость второго голоса", 40, 100, "%", progress -> {
                       setHarmonyMix(progress / 100.0f);
                   });
 
                   root.addView(harmonyCard);
                   addSpacer(root, 16);
 
-                  // --- CARD 3: STUDIO EFFECTS (REVERB, GAIN, AIR) ---
+                  // --- CARD 3: STUDIO EFFECTS ---
                   LinearLayout fxCard = createCard();
                   TextView fxTitle = new TextView(this);
                   fxTitle.setText("🎛 Студийная обработка");
@@ -646,76 +784,246 @@ jobs:
                   fxTitle.setTypeface(Typeface.DEFAULT_BOLD);
                   fxCard.addView(fxTitle);
 
-                  addSpacer(fxCard, 14);
+                  addSpacer(fxCard, 12);
 
-                  addSlider(fxCard, "✨ Реверберация (Studio Hall)", 25, 100, "%", progress -> {
+                  reverbSeekBar = addSlider(fxCard, "✨ Реверберация (Studio Hall)", 30, 100, "%", progress -> {
+                      currentReverbPct = progress;
                       setReverb(progress / 100.0f);
+                      if (floatRevText != null) floatRevText.setText("Эхо: " + progress + "%");
                   });
 
                   addSpacer(fxCard, 12);
 
-                  addSlider(fxCard, "🎤 Усиление микрофона (Gain)", 120, 250, "%", progress -> {
+                  addSlider(fxCard, "🎤 Усиление микрофона (Gain)", 130, 250, "%", progress -> {
                       setGain(progress / 100.0f);
                   });
 
                   addSpacer(fxCard, 12);
 
-                  addSlider(fxCard, "💎 Яркость и воздух (Air EQ)", 30, 100, "%", progress -> {
+                  addSlider(fxCard, "💎 Яркость и воздух (Air EQ)", 35, 100, "%", progress -> {
                       setBrightness(progress / 100.0f);
                   });
 
                   root.addView(fxCard);
-                  addSpacer(root, 24);
+                  addSpacer(root, 20);
 
                   // --- MAIN START / STOP BUTTON ---
-                  final Button mainButton = new Button(this);
+                  mainButton = new Button(this);
                   mainButton.setText("▶  ЗАПУСТИТЬ МОНИТОРИНГ");
                   mainButton.setTextSize(16f);
                   mainButton.setAllCaps(false);
                   mainButton.setTypeface(Typeface.DEFAULT_BOLD);
                   mainButton.setTextColor(COLOR_ON_PRIMARY);
                   mainButton.setBackground(createRoundedRect(COLOR_PRIMARY, 28, 0, 0));
-                  LinearLayout.LayoutParams btnParams = new LinearLayout.LayoutParams(
-                          LinearLayout.LayoutParams.MATCH_PARENT, dp(60));
-                  mainButton.setLayoutParams(btnParams);
+                  mainButton.setLayoutParams(new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(58)));
 
-                  mainButton.setOnClickListener(v -> {
-                      if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                          requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1);
-                          Toast.makeText(this, "Разрешите доступ к микрофону!", Toast.LENGTH_SHORT).show();
-                          return;
-                      }
-                      if (isMonitoring) {
-                          stopMonitoring();
-                          isMonitoring = false;
-                          statusBadge.setText("● ОЖИДАНИЕ");
-                          statusBadge.setTextColor(COLOR_TEXT_MUTED);
-                          statusBadge.setBackground(createRoundedRect(COLOR_CARD_HIGHLIGHT, 50, 0, 0));
-                          mainButton.setText("▶  ЗАПУСТИТЬ МОНИТОРИНГ");
-                          mainButton.setTextColor(COLOR_ON_PRIMARY);
-                          mainButton.setBackground(createRoundedRect(COLOR_PRIMARY, 28, 0, 0));
-                      } else {
-                          if (startMonitoring()) {
-                              isMonitoring = true;
-                              statusBadge.setText("● LIVE В ЭФИРЕ");
-                              statusBadge.setTextColor(Color.parseColor("#0A3818"));
-                              statusBadge.setBackground(createRoundedRect(COLOR_ACTIVE_GREEN, 50, 0, 0));
-                              mainButton.setText("⏹  ОСТАНОВИТЬ МОНИТОРИНГ");
-                              mainButton.setTextColor(COLOR_ON_STOP_RED);
-                              mainButton.setBackground(createRoundedRect(COLOR_STOP_RED, 28, 0, 0));
-                          } else {
-                              Toast.makeText(this, "Ошибка запуска аудиопотока", Toast.LENGTH_SHORT).show();
-                          }
-                      }
-                  });
+                  mainButton.setOnClickListener(v -> toggleEngine());
 
                   root.addView(mainButton);
 
                   scrollView.addView(root);
                   setContentView(scrollView);
 
-                  // Start UI VU-meter loop
                   uiHandler.post(levelUpdater);
+              }
+
+              private void toggleEngine() {
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1);
+                      Toast.makeText(this, "Разрешите доступ к микрофону!", Toast.LENGTH_SHORT).show();
+                      return;
+                  }
+                  if (isMonitoring) {
+                      stopMonitoring();
+                      stopService(new Intent(this, VocalService.class));
+                      isMonitoring = false;
+                      updateStatusUI();
+                  } else {
+                      Intent serviceIntent = new Intent(this, VocalService.class);
+                      if (Build.VERSION.SDK_INT >= 26) {
+                          startForegroundService(serviceIntent);
+                      } else {
+                          startService(serviceIntent);
+                      }
+                      if (startMonitoring()) {
+                          isMonitoring = true;
+                          updateStatusUI();
+                      } else {
+                          Toast.makeText(this, "Ошибка запуска аудиопотока", Toast.LENGTH_SHORT).show();
+                      }
+                  }
+              }
+
+              private void updateStatusUI() {
+                  if (isMonitoring) {
+                      statusBadge.setText("● LIVE В ФОНЕ");
+                      statusBadge.setTextColor(Color.parseColor("#0A3818"));
+                      statusBadge.setBackground(createRoundedRect(COLOR_ACTIVE_GREEN, 50, 0, 0));
+                      mainButton.setText("⏹  ОСТАНОВИТЬ МОНИТОРИНГ");
+                      mainButton.setTextColor(COLOR_ON_STOP_RED);
+                      mainButton.setBackground(createRoundedRect(COLOR_STOP_RED, 28, 0, 0));
+                  } else {
+                      statusBadge.setText("● ОЖИДАНИЕ");
+                      statusBadge.setTextColor(COLOR_TEXT_MUTED);
+                      statusBadge.setBackground(createRoundedRect(COLOR_CARD_HIGHLIGHT, 50, 0, 0));
+                      mainButton.setText("▶  ЗАПУСТИТЬ МОНИТОРИНГ");
+                      mainButton.setTextColor(COLOR_ON_PRIMARY);
+                      mainButton.setBackground(createRoundedRect(COLOR_PRIMARY, 28, 0, 0));
+                  }
+              }
+
+              private void launchYouTubeMusicKaraoke() {
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1);
+                      Toast.makeText(this, "Сначала разрешите доступ к микрофону!", Toast.LENGTH_SHORT).show();
+                      return;
+                  }
+
+                  // Check permission for floating mini-controller
+                  if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) {
+                      Toast.makeText(this, "Включите разрешение «Поверх других окон» для мини-пульта и нажмите кнопку еще раз!", Toast.LENGTH_LONG).show();
+                      Intent intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + getPackageName()));
+                      startActivity(intent);
+                      return;
+                  }
+
+                  if (!isMonitoring) {
+                      toggleEngine();
+                  }
+
+                  showFloatingMiniController();
+
+                  Intent ytIntent = getPackageManager().getLaunchIntentForPackage("com.google.android.apps.youtube.music");
+                  if (ytIntent != null) {
+                      startActivity(ytIntent);
+                  } else {
+                      Intent webIntent = new Intent(Intent.ACTION_VIEW, Uri.parse("https://music.youtube.com"));
+                      startActivity(webIntent);
+                  }
+              }
+
+              private void showFloatingMiniController() {
+                  if (floatingView != null) return;
+
+                  windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+                  int layoutType = Build.VERSION.SDK_INT >= 26
+                          ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                          : WindowManager.LayoutParams.TYPE_PHONE;
+
+                  final WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                          WindowManager.LayoutParams.WRAP_CONTENT,
+                          WindowManager.LayoutParams.WRAP_CONTENT,
+                          layoutType,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                          PixelFormat.TRANSLUCENT
+                  );
+                  params.gravity = Gravity.TOP | Gravity.START;
+                  params.x = dp(16);
+                  params.y = dp(180);
+
+                  final LinearLayout container = new LinearLayout(this);
+                  container.setOrientation(LinearLayout.VERTICAL);
+                  container.setPadding(dp(12), dp(10), dp(12), dp(10));
+                  container.setBackground(createRoundedRect(Color.parseColor("#E61D1B20"), 22, COLOR_PRIMARY, 1));
+
+                  final TextView pillBtn = new TextView(this);
+                  pillBtn.setText("🎤 Studio");
+                  pillBtn.setTextColor(COLOR_PRIMARY);
+                  pillBtn.setTextSize(14f);
+                  pillBtn.setTypeface(Typeface.DEFAULT_BOLD);
+                  container.addView(pillBtn);
+
+                  final LinearLayout controlsBox = new LinearLayout(this);
+                  controlsBox.setOrientation(LinearLayout.VERTICAL);
+                  controlsBox.setVisibility(View.GONE);
+                  controlsBox.setPadding(0, dp(8), 0, 0);
+
+                  floatHarmText = new TextView(this);
+                  floatHarmText.setText("Гарм: " + harmonyNames[selectedHarmony]);
+                  floatHarmText.setTextColor(Color.WHITE);
+                  floatHarmText.setTextSize(12f);
+                  floatHarmText.setPadding(dp(10), dp(6), dp(10), dp(6));
+                  floatHarmText.setBackground(createRoundedRect(COLOR_CARD_HIGHLIGHT, 12, 0, 0));
+                  floatHarmText.setOnClickListener(v -> {
+                      int next = (selectedHarmony + 1) % harmonyNames.length;
+                      selectHarmonyChip(next);
+                  });
+                  controlsBox.addView(floatHarmText);
+
+                  View sp1 = new View(this);
+                  sp1.setLayoutParams(new LinearLayout.LayoutParams(dp(10), dp(6)));
+                  controlsBox.addView(sp1);
+
+                  floatRevText = new TextView(this);
+                  floatRevText.setText("Эхо: " + currentReverbPct + "%");
+                  floatRevText.setTextColor(Color.WHITE);
+                  floatRevText.setTextSize(12f);
+                  floatRevText.setPadding(dp(10), dp(6), dp(10), dp(6));
+                  floatRevText.setBackground(createRoundedRect(COLOR_CARD_HIGHLIGHT, 12, 0, 0));
+                  floatRevText.setOnClickListener(v -> {
+                      int nextRev = (currentReverbPct + 20) % 100;
+                      currentReverbPct = nextRev;
+                      if (reverbSeekBar != null) reverbSeekBar.setProgress(nextRev);
+                      setReverb(nextRev / 100.0f);
+                      floatRevText.setText("Эхо: " + nextRev + "%");
+                  });
+                  controlsBox.addView(floatRevText);
+
+                  View sp2 = new View(this);
+                  sp2.setLayoutParams(new LinearLayout.LayoutParams(dp(10), dp(6)));
+                  controlsBox.addView(sp2);
+
+                  TextView closeFloat = new TextView(this);
+                  closeFloat.setText("✕ Скрыть пульт");
+                  closeFloat.setTextColor(COLOR_STOP_RED);
+                  closeFloat.setTextSize(11f);
+                  closeFloat.setGravity(Gravity.CENTER);
+                  closeFloat.setPadding(dp(8), dp(4), dp(8), dp(4));
+                  closeFloat.setOnClickListener(v -> removeFloatingMiniController());
+                  controlsBox.addView(closeFloat);
+
+                  container.addView(controlsBox);
+
+                  pillBtn.setOnTouchListener(new View.OnTouchListener() {
+                      private int initialX, initialY;
+                      private float initialTouchX, initialTouchY;
+                      private long touchStartTime;
+
+                      @Override
+                      public boolean onTouch(View v, MotionEvent event) {
+                          switch (event.getAction()) {
+                              case MotionEvent.ACTION_DOWN:
+                                  initialX = params.x;
+                                  initialY = params.y;
+                                  initialTouchX = event.getRawX();
+                                  initialTouchY = event.getRawY();
+                                  touchStartTime = System.currentTimeMillis();
+                                  return true;
+                              case MotionEvent.ACTION_MOVE:
+                                  params.x = initialX + (int) (event.getRawX() - initialTouchX);
+                                  params.y = initialY + (int) (event.getRawY() - initialTouchY);
+                                  windowManager.updateViewLayout(container, params);
+                                  return true;
+                              case MotionEvent.ACTION_UP:
+                                  if (System.currentTimeMillis() - touchStartTime < 200) {
+                                      isOverlayExpanded = !isOverlayExpanded;
+                                      controlsBox.setVisibility(isOverlayExpanded ? View.VISIBLE : View.GONE);
+                                  }
+                                  return true;
+                          }
+                          return false;
+                      }
+                  });
+
+                  floatingView = container;
+                  windowManager.addView(floatingView, params);
+              }
+
+              private void removeFloatingMiniController() {
+                  if (floatingView != null && windowManager != null) {
+                      windowManager.removeView(floatingView);
+                      floatingView = null;
+                  }
               }
 
               private final Runnable levelUpdater = new Runnable() {
@@ -737,13 +1045,16 @@ jobs:
                           levelBar.setProgress(0);
                           levelValueText.setText("0%");
                       }
-                      uiHandler.postDelayed(this, 35);
+                      uiHandler.postDelayed(this, 40);
                   }
               };
 
               private void selectHarmonyChip(int index) {
                   selectedHarmony = index;
                   setHarmonyMode(index);
+                  if (floatHarmText != null) {
+                      floatHarmText.setText("Гарм: " + harmonyNames[index]);
+                  }
                   for (int i = 0; i < harmonyButtons.length; i++) {
                       if (i == index) {
                           harmonyButtons[i].setBackground(createRoundedRect(COLOR_PRIMARY, 20, 0, 0));
@@ -760,7 +1071,7 @@ jobs:
               private LinearLayout createCard() {
                   LinearLayout card = new LinearLayout(this);
                   card.setOrientation(LinearLayout.VERTICAL);
-                  card.setPadding(dp(18), dp(18), dp(18), dp(18));
+                  card.setPadding(dp(18), dp(16), dp(18), dp(16));
                   card.setBackground(createRoundedRect(COLOR_CARD, 24, Color.parseColor("#2B2930"), 1));
                   return card;
               }
@@ -775,7 +1086,7 @@ jobs:
                   void onValueChanged(int progress);
               }
 
-              private void addSlider(LinearLayout parent, String label, int initial, int max, final String suffix, final SliderCallback callback) {
+              private SeekBar addSlider(LinearLayout parent, String label, int initial, int max, final String suffix, final SliderCallback callback) {
                   LinearLayout row = new LinearLayout(this);
                   row.setOrientation(LinearLayout.HORIZONTAL);
 
@@ -813,14 +1124,17 @@ jobs:
                       @Override public void onStopTrackingTouch(SeekBar sb) {}
                   });
                   parent.addView(seekBar);
+                  return seekBar;
               }
 
               @Override
               protected void onDestroy() {
                   super.onDestroy();
                   uiHandler.removeCallbacks(levelUpdater);
+                  removeFloatingMiniController();
                   if (isMonitoring) {
                       stopMonitoring();
+                      stopService(new Intent(this, VocalService.class));
                       isMonitoring = false;
                   }
               }
@@ -833,5 +1147,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: VocalStudioPro-APK
+          name: VocalStudioPro-Karaoke-APK
           path: app/build/outputs/apk/debug/app-debug.apk
