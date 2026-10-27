@@ -67,8 +67,8 @@ jobs:
                   applicationId "com.example.livemonitor"
                   minSdk 24
                   targetSdk 34
-                  versionCode 1
-                  versionName "1.0"
+                  versionCode 2
+                  versionName "2.0-Pro"
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_1_8
@@ -87,11 +87,12 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.RECORD_AUDIO" />
               <application
-                  android:label="LiveMonitor"
+                  android:label="Vocal Studio Pro"
                   android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
                   <activity
                       android:name=".MainActivity"
-                      android:exported="true">
+                      android:exported="true"
+                      android:screenOrientation="portrait">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
@@ -104,6 +105,7 @@ jobs:
           cat << 'EOF' > app/src/main/cpp/CMakeLists.txt
           cmake_minimum_required(VERSION 3.18.1)
           project("livemonitor")
+          set(CMAKE_CXX_STANDARD 17)
           set(OBOE_DIR ./oboe)
           add_subdirectory(${OBOE_DIR} ./oboe)
           include_directories(${OBOE_DIR}/include)
@@ -117,32 +119,207 @@ jobs:
           #include <oboe/Oboe.h>
           #include <memory>
           #include <cstring>
+          #include <cmath>
+          #include <atomic>
+          #include <vector>
 
           class LiveEngine : public oboe::AudioStreamCallback {
           private:
               std::shared_ptr<oboe::AudioStream> mRecordingStream;
               std::shared_ptr<oboe::AudioStream> mPlaybackStream;
 
+              std::atomic<float> mGain{1.2f};
+              std::atomic<float> mReverbMix{0.25f};
+              std::atomic<float> mHarmonyMix{0.40f};
+              std::atomic<int> mHarmonyMode{0};
+              std::atomic<float> mBrightness{0.30f};
+              std::atomic<float> mPeakLevel{0.0f};
+
+              // Pitch shifter circular buffer (4096 samples)
+              static constexpr int PITCH_BUF_SIZE = 4096;
+              static constexpr int PITCH_BUF_MASK = PITCH_BUF_SIZE - 1;
+              static constexpr float GRAIN_SIZE = 1024.0f;
+              float mPitchBuf[PITCH_BUF_SIZE];
+              int mPitchWriteIdx = 0;
+              float mPitchPhase = 0.0f;
+
+              // High-shelf / Air EQ state
+              float mPrevInput = 0.0f;
+
+              // Schroeder Reverb buffers
+              std::vector<float> mComb1, mComb2, mComb3, mComb4;
+              int mCombIdx1 = 0, mCombIdx2 = 0, mCombIdx3 = 0, mCombIdx4 = 0;
+              float mCombStore1 = 0.0f, mCombStore2 = 0.0f, mCombStore3 = 0.0f, mCombStore4 = 0.0f;
+
+              std::vector<float> mAllPass1, mAllPass2;
+              int mApIdx1 = 0, mApIdx2 = 0;
+
+              int mWarmupCallbacks = 0;
+
+              void initDSP() {
+                  std::memset(mPitchBuf, 0, sizeof(mPitchBuf));
+                  mPitchWriteIdx = 0;
+                  mPitchPhase = 0.0f;
+                  mPrevInput = 0.0f;
+
+                  mComb1.assign(1557, 0.0f);
+                  mComb2.assign(1617, 0.0f);
+                  mComb3.assign(1491, 0.0f);
+                  mComb4.assign(1422, 0.0f);
+                  mCombIdx1 = mCombIdx2 = mCombIdx3 = mCombIdx4 = 0;
+                  mCombStore1 = mCombStore2 = mCombStore3 = mCombStore4 = 0.0f;
+
+                  mAllPass1.assign(225, 0.0f);
+                  mAllPass2.assign(556, 0.0f);
+                  mApIdx1 = mApIdx2 = 0;
+              }
+
+              inline float readPitchSample(float delaySamples) {
+                  float readPos = static_cast<float>(mPitchWriteIdx) - delaySamples;
+                  while (readPos < 0.0f) readPos += PITCH_BUF_SIZE;
+                  int idx0 = static_cast<int>(readPos) & PITCH_BUF_MASK;
+                  int idx1 = (idx0 + 1) & PITCH_BUF_MASK;
+                  float frac = readPos - std::floor(readPos);
+                  return mPitchBuf[idx0] * (1.0f - frac) + mPitchBuf[idx1] * frac;
+              }
+
+              inline float processPitchShift(float input, float pitchRatio) {
+                  mPitchBuf[mPitchWriteIdx] = input;
+                  float phaseInc = (1.0f - pitchRatio) / GRAIN_SIZE;
+                  mPitchPhase += phaseInc;
+                  if (mPitchPhase >= 1.0f) mPitchPhase -= 1.0f;
+                  if (mPitchPhase < 0.0f) mPitchPhase += 1.0f;
+
+                  float phaseA = mPitchPhase;
+                  float phaseB = mPitchPhase + 0.5f;
+                  if (phaseB >= 1.0f) phaseB -= 1.0f;
+
+                  float delayA = phaseA * GRAIN_SIZE + 64.0f;
+                  float delayB = phaseB * GRAIN_SIZE + 64.0f;
+
+                  float weightA = 0.5f * (1.0f - std::cos(2.0f * 3.14159265f * phaseA));
+                  float weightB = 0.5f * (1.0f - std::cos(2.0f * 3.14159265f * phaseB));
+
+                  float sample = readPitchSample(delayA) * weightA + readPitchSample(delayB) * weightB;
+                  mPitchWriteIdx = (mPitchWriteIdx + 1) & PITCH_BUF_MASK;
+                  return sample;
+              }
+
+              inline float processComb(float input, std::vector<float>& buf, int& idx, float& filterStore, float feedback, float damp) {
+                  float output = buf[idx];
+                  filterStore = (output * (1.0f - damp)) + (filterStore * damp);
+                  buf[idx] = input + (filterStore * feedback);
+                  if (++idx >= static_cast<int>(buf.size())) idx = 0;
+                  return output;
+              }
+
+              inline float processAllPass(float input, std::vector<float>& buf, int& idx) {
+                  float bufOut = buf[idx];
+                  float output = -input + bufOut;
+                  buf[idx] = input + (bufOut * 0.5f);
+                  if (++idx >= static_cast<int>(buf.size())) idx = 0;
+                  return output;
+              }
+
+              inline float processReverb(float input, float reverbAmount) {
+                  float feedback = 0.72f + reverbAmount * 0.16f;
+                  float damp = 0.25f;
+                  float out = 0.0f;
+                  out += processComb(input, mComb1, mCombIdx1, mCombStore1, feedback, damp);
+                  out += processComb(input, mComb2, mCombIdx2, mCombStore2, feedback, damp);
+                  out += processComb(input, mComb3, mCombIdx3, mCombStore3, feedback, damp);
+                  out += processComb(input, mComb4, mCombIdx4, mCombStore4, feedback, damp);
+                  out = processAllPass(out, mAllPass1, mApIdx1);
+                  out = processAllPass(out, mAllPass2, mApIdx2);
+                  return out * 0.22f;
+              }
+
           public:
+              LiveEngine() {
+                  initDSP();
+              }
+
               oboe::DataCallbackResult onAudioReady(oboe::AudioStream *audioStream, void *audioData, int32_t numFrames) override {
                   float *outputBuffer = static_cast<float *>(audioData);
                   if (!mRecordingStream) {
                       std::memset(outputBuffer, 0, numFrames * sizeof(float));
                       return oboe::DataCallbackResult::Continue;
                   }
-                  auto result = mRecordingStream->read(outputBuffer, numFrames, 0);
-                  if (result == oboe::Result::OK) {
-                      int32_t framesRead = result.value();
-                      if (framesRead < numFrames) {
-                          std::memset(outputBuffer + framesRead, 0, (numFrames - framesRead) * sizeof(float));
-                      }
-                  } else {
-                      std::memset(outputBuffer, 0, numFrames * sizeof(float));
+
+                  // Drain initial backlog during first few callbacks to minimize latency
+                  if (mWarmupCallbacks < 6) {
+                      float discardBuf[512];
+                      while (mRecordingStream->read(discardBuf, 512, 0).value() == 512) {}
+                      mWarmupCallbacks++;
                   }
+
+                  auto result = mRecordingStream->read(outputBuffer, numFrames, 0);
+                  int32_t framesRead = (result == oboe::Result::OK) ? result.value() : 0;
+                  if (framesRead < numFrames) {
+                      std::memset(outputBuffer + framesRead, 0, (numFrames - framesRead) * sizeof(float));
+                  }
+
+                  float gain = mGain.load();
+                  float revMix = mReverbMix.load();
+                  float harmMix = mHarmonyMix.load();
+                  int harmMode = mHarmonyMode.load();
+                  float bright = mBrightness.load();
+
+                  float pitchRatio = 1.0f;
+                  if (harmMode == 1) pitchRatio = 1.008f;      // Chorus / Double track
+                  else if (harmMode == 2) pitchRatio = 1.2599f; // Major 3rd (+4 semitones)
+                  else if (harmMode == 3) pitchRatio = 1.4983f; // Perfect 5th (+7 semitones)
+                  else if (harmMode == 4) pitchRatio = 0.5000f; // Sub-Octave (-12 semitones)
+
+                  float maxPeak = 0.0f;
+
+                  for (int32_t i = 0; i < numFrames; ++i) {
+                      float raw = outputBuffer[i] * gain;
+
+                      // Air / High-frequency crispness filter
+                      float highFreq = raw - mPrevInput;
+                      mPrevInput = raw;
+                      float dry = raw + highFreq * (bright * 0.8f);
+
+                      // Vocal Harmony
+                      float harmony = 0.0f;
+                      if (harmMode > 0 && harmMix > 0.01f) {
+                          harmony = processPitchShift(dry, pitchRatio) * harmMix;
+                      } else {
+                          mPitchBuf[mPitchWriteIdx] = dry;
+                          mPitchWriteIdx = (mPitchWriteIdx + 1) & PITCH_BUF_MASK;
+                      }
+
+                      float combined = dry + harmony;
+
+                      // Studio Reverb
+                      float wet = 0.0f;
+                      if (revMix > 0.01f) {
+                          wet = processReverb(combined, revMix) * revMix;
+                      }
+
+                      // Soft limiter (prevents nasty digital clipping in headphones)
+                      float finalOut = std::tanh(combined + wet);
+                      outputBuffer[i] = finalOut;
+
+                      float absVal = std::fabs(finalOut);
+                      if (absVal > maxPeak) maxPeak = absVal;
+                  }
+
+                  float currentPeak = mPeakLevel.load();
+                  if (maxPeak > currentPeak) {
+                      mPeakLevel.store(maxPeak);
+                  } else {
+                      mPeakLevel.store(currentPeak * 0.85f);
+                  }
+
                   return oboe::DataCallbackResult::Continue;
               }
 
               bool start() {
+                  initDSP();
+                  mWarmupCallbacks = 0;
+
                   oboe::AudioStreamBuilder outBuilder;
                   outBuilder.setDirection(oboe::Direction::Output)
                           ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
@@ -188,7 +365,15 @@ jobs:
                       mRecordingStream->close();
                       mRecordingStream.reset();
                   }
+                  mPeakLevel.store(0.0f);
               }
+
+              void setGain(float val) { mGain.store(val); }
+              void setReverb(float val) { mReverbMix.store(val); }
+              void setHarmonyMix(float val) { mHarmonyMix.store(val); }
+              void setHarmonyMode(int mode) { mHarmonyMode.store(mode); }
+              void setBrightness(float val) { mBrightness.store(val); }
+              float getPeak() { return mPeakLevel.load(); }
           };
 
           static LiveEngine engine;
@@ -202,6 +387,36 @@ jobs:
           Java_com_example_livemonitor_MainActivity_stopMonitoring(JNIEnv *env, jobject thiz) {
               engine.stop();
           }
+
+          extern "C" JNIEXPORT void JNICALL
+          Java_com_example_livemonitor_MainActivity_setGain(JNIEnv *env, jobject thiz, jfloat val) {
+              engine.setGain(val);
+          }
+
+          extern "C" JNIEXPORT void JNICALL
+          Java_com_example_livemonitor_MainActivity_setReverb(JNIEnv *env, jobject thiz, jfloat val) {
+              engine.setReverb(val);
+          }
+
+          extern "C" JNIEXPORT void JNICALL
+          Java_com_example_livemonitor_MainActivity_setHarmonyMix(JNIEnv *env, jobject thiz, jfloat val) {
+              engine.setHarmonyMix(val);
+          }
+
+          extern "C" JNIEXPORT void JNICALL
+          Java_com_example_livemonitor_MainActivity_setHarmonyMode(JNIEnv *env, jobject thiz, jint mode) {
+              engine.setHarmonyMode(mode);
+          }
+
+          extern "C" JNIEXPORT void JNICALL
+          Java_com_example_livemonitor_MainActivity_setBrightness(JNIEnv *env, jobject thiz, jfloat val) {
+              engine.setBrightness(val);
+          }
+
+          extern "C" JNIEXPORT jfloat JNICALL
+          Java_com_example_livemonitor_MainActivity_getPeakLevel(JNIEnv *env, jobject thiz) {
+              return engine.getPeak();
+          }
           EOF
 
           cat << 'EOF' > app/src/main/java/com/example/livemonitor/MainActivity.java
@@ -210,11 +425,22 @@ jobs:
           import android.Manifest;
           import android.app.Activity;
           import android.content.pm.PackageManager;
+          import android.content.res.ColorStateList;
           import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.GradientDrawable;
           import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
           import android.view.Gravity;
+          import android.view.View;
+          import android.view.Window;
           import android.widget.Button;
+          import android.widget.HorizontalScrollView;
           import android.widget.LinearLayout;
+          import android.widget.ProgressBar;
+          import android.widget.ScrollView;
+          import android.widget.SeekBar;
           import android.widget.TextView;
           import android.widget.Toast;
 
@@ -225,35 +451,235 @@ jobs:
 
               private native boolean startMonitoring();
               private native void stopMonitoring();
+              private native void setGain(float val);
+              private native void setReverb(float val);
+              private native void setHarmonyMix(float val);
+              private native void setHarmonyMode(int mode);
+              private native void setBrightness(float val);
+              private native float getPeakLevel();
 
               private boolean isMonitoring = false;
+              private int selectedHarmony = 0;
+              private Button[] harmonyButtons = new Button[5];
+              private ProgressBar levelBar;
+              private TextView levelValueText;
+              private Handler uiHandler = new Handler(Looper.getMainLooper());
+
+              // Material 3 Dark Colors
+              private final int COLOR_BG = Color.parseColor("#0F0D13");
+              private final int COLOR_CARD = Color.parseColor("#1D1B20");
+              private final int COLOR_CARD_HIGHLIGHT = Color.parseColor("#2B2930");
+              private final int COLOR_PRIMARY = Color.parseColor("#D0BCFF");
+              private final int COLOR_ON_PRIMARY = Color.parseColor("#381E72");
+              private final int COLOR_SECONDARY = Color.parseColor("#CCC2DC");
+              private final int COLOR_TEXT = Color.parseColor("#E6E0E9");
+              private final int COLOR_TEXT_MUTED = Color.parseColor("#938F99");
+              private final int COLOR_ACTIVE_GREEN = Color.parseColor("#6DD58C");
+              private final int COLOR_STOP_RED = Color.parseColor("#F2B8B5");
+              private final int COLOR_ON_STOP_RED = Color.parseColor("#601410");
+
+              private int dp(int value) {
+                  return (int) (value * getResources().getDisplayMetrics().density);
+              }
+
+              private GradientDrawable createRoundedRect(int bgColor, int radiusDp, int strokeColor, int strokeWidthDp) {
+                  GradientDrawable gd = new GradientDrawable();
+                  gd.setColor(bgColor);
+                  gd.setCornerRadius(dp(radiusDp));
+                  if (strokeWidthDp > 0) {
+                      gd.setStroke(dp(strokeWidthDp), strokeColor);
+                  }
+                  return gd;
+              }
 
               @Override
               protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
 
+                  Window window = getWindow();
+                  window.setStatusBarColor(COLOR_BG);
+                  window.setNavigationBarColor(COLOR_BG);
+
                   if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
                       requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1);
                   }
 
-                  LinearLayout layout = new LinearLayout(this);
-                  layout.setOrientation(LinearLayout.VERTICAL);
-                  layout.setGravity(Gravity.CENTER);
-                  layout.setBackgroundColor(Color.parseColor("#121212"));
-                  layout.setPadding(48, 48, 48, 48);
+                  ScrollView scrollView = new ScrollView(this);
+                  scrollView.setBackgroundColor(COLOR_BG);
+                  scrollView.setFillViewport(true);
 
-                  final TextView statusText = new TextView(this);
-                  statusText.setText("Мониторинг ВЫКЛЮЧЕН");
-                  statusText.setTextColor(Color.WHITE);
-                  statusText.setTextSize(22f);
-                  statusText.setGravity(Gravity.CENTER);
-                  statusText.setPadding(0, 0, 0, 48);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(dp(20), dp(28), dp(20), dp(32));
 
-                  final Button toggleButton = new Button(this);
-                  toggleButton.setText("Запустить");
-                  toggleButton.setTextSize(18f);
+                  // --- HEADER SECTION ---
+                  LinearLayout headerRow = new LinearLayout(this);
+                  headerRow.setOrientation(LinearLayout.HORIZONTAL);
+                  headerRow.setGravity(Gravity.CENTER_VERTICAL);
 
-                  toggleButton.setOnClickListener(v -> {
+                  LinearLayout titleCol = new LinearLayout(this);
+                  titleCol.setOrientation(LinearLayout.VERTICAL);
+                  LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+                  titleCol.setLayoutParams(titleParams);
+
+                  TextView appTitle = new TextView(this);
+                  appTitle.setText("Vocal Studio Pro");
+                  appTitle.setTextColor(COLOR_TEXT);
+                  appTitle.setTextSize(26f);
+                  appTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+
+                  TextView appSub = new TextView(this);
+                  appSub.setText("Oboe C++ • Мониторинг без задержки");
+                  appSub.setTextColor(COLOR_TEXT_MUTED);
+                  appSub.setTextSize(13f);
+
+                  titleCol.addView(appTitle);
+                  titleCol.addView(appSub);
+
+                  final TextView statusBadge = new TextView(this);
+                  statusBadge.setText("● ОЖИДАНИЕ");
+                  statusBadge.setTextColor(COLOR_TEXT_MUTED);
+                  statusBadge.setTextSize(12f);
+                  statusBadge.setTypeface(Typeface.DEFAULT_BOLD);
+                  statusBadge.setPadding(dp(14), dp(8), dp(14), dp(8));
+                  statusBadge.setBackground(createRoundedRect(COLOR_CARD_HIGHLIGHT, 50, 0, 0));
+
+                  headerRow.addView(titleCol);
+                  headerRow.addView(statusBadge);
+                  root.addView(headerRow);
+
+                  addSpacer(root, 20);
+
+                  // --- CARD 1: LIVE VU METER ---
+                  LinearLayout meterCard = createCard();
+                  LinearLayout meterHeader = new LinearLayout(this);
+                  meterHeader.setOrientation(LinearLayout.HORIZONTAL);
+
+                  TextView meterTitle = new TextView(this);
+                  meterTitle.setText("🎙 Уровень вокала (Live Input)");
+                  meterTitle.setTextColor(COLOR_SECONDARY);
+                  meterTitle.setTextSize(14f);
+                  meterTitle.setTypeface(Typeface.DEFAULT_BOLD);
+                  meterTitle.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+                  levelValueText = new TextView(this);
+                  levelValueText.setText("0%");
+                  levelValueText.setTextColor(COLOR_PRIMARY);
+                  levelValueText.setTextSize(14f);
+                  levelValueText.setTypeface(Typeface.DEFAULT_BOLD);
+
+                  meterHeader.addView(meterTitle);
+                  meterHeader.addView(levelValueText);
+                  meterCard.addView(meterHeader);
+
+                  addSpacer(meterCard, 12);
+
+                  levelBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+                  levelBar.setMax(100);
+                  levelBar.setProgress(0);
+                  levelBar.setProgressTintList(ColorStateList.valueOf(COLOR_PRIMARY));
+                  levelBar.setProgressBackgroundTintList(ColorStateList.valueOf(COLOR_CARD_HIGHLIGHT));
+                  LinearLayout.LayoutParams barParams = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(12));
+                  levelBar.setLayoutParams(barParams);
+                  meterCard.addView(levelBar);
+
+                  root.addView(meterCard);
+                  addSpacer(root, 16);
+
+                  // --- CARD 2: HARMONY SELECTOR ---
+                  LinearLayout harmonyCard = createCard();
+                  TextView harmTitle = new TextView(this);
+                  harmTitle.setText("🎶 Вокальная гармония (Pitch Shifter)");
+                  harmTitle.setTextColor(COLOR_SECONDARY);
+                  harmTitle.setTextSize(15f);
+                  harmTitle.setTypeface(Typeface.DEFAULT_BOLD);
+                  harmonyCard.addView(harmTitle);
+
+                  TextView harmSub = new TextView(this);
+                  harmSub.setText("Добавляет второй голос в реальном времени поверх вашего");
+                  harmSub.setTextColor(COLOR_TEXT_MUTED);
+                  harmSub.setTextSize(12f);
+                  harmonyCard.addView(harmSub);
+
+                  addSpacer(harmonyCard, 14);
+
+                  HorizontalScrollView chipScroll = new HorizontalScrollView(this);
+                  chipScroll.setHorizontalScrollBarEnabled(false);
+                  LinearLayout chipRow = new LinearLayout(this);
+                  chipRow.setOrientation(LinearLayout.HORIZONTAL);
+
+                  String[] modes = {"Выкл", "Дабл / Хор", "Терция (+4)", "Квинта (+7)", "Октава (-12)"};
+                  for (int i = 0; i < modes.length; i++) {
+                      final int index = i;
+                      Button chip = new Button(this);
+                      chip.setText(modes[i]);
+                      chip.setAllCaps(false);
+                      chip.setTextSize(13f);
+                      chip.setPadding(dp(16), dp(8), dp(16), dp(8));
+                      LinearLayout.LayoutParams chipParams = new LinearLayout.LayoutParams(
+                              LinearLayout.LayoutParams.WRAP_CONTENT, dp(42));
+                      chipParams.setMargins(0, 0, dp(8), 0);
+                      chip.setLayoutParams(chipParams);
+                      chip.setOnClickListener(v -> selectHarmonyChip(index));
+                      harmonyButtons[i] = chip;
+                      chipRow.addView(chip);
+                  }
+                  chipScroll.addView(chipRow);
+                  harmonyCard.addView(chipScroll);
+                  selectHarmonyChip(0);
+
+                  addSpacer(harmonyCard, 16);
+
+                  addSlider(harmonyCard, "Громкость гармонии", 40, 100, "%", progress -> {
+                      setHarmonyMix(progress / 100.0f);
+                  });
+
+                  root.addView(harmonyCard);
+                  addSpacer(root, 16);
+
+                  // --- CARD 3: STUDIO EFFECTS (REVERB, GAIN, AIR) ---
+                  LinearLayout fxCard = createCard();
+                  TextView fxTitle = new TextView(this);
+                  fxTitle.setText("🎛 Студийная обработка");
+                  fxTitle.setTextColor(COLOR_SECONDARY);
+                  fxTitle.setTextSize(15f);
+                  fxTitle.setTypeface(Typeface.DEFAULT_BOLD);
+                  fxCard.addView(fxTitle);
+
+                  addSpacer(fxCard, 14);
+
+                  addSlider(fxCard, "✨ Реверберация (Studio Hall)", 25, 100, "%", progress -> {
+                      setReverb(progress / 100.0f);
+                  });
+
+                  addSpacer(fxCard, 12);
+
+                  addSlider(fxCard, "🎤 Усиление микрофона (Gain)", 120, 250, "%", progress -> {
+                      setGain(progress / 100.0f);
+                  });
+
+                  addSpacer(fxCard, 12);
+
+                  addSlider(fxCard, "💎 Яркость и воздух (Air EQ)", 30, 100, "%", progress -> {
+                      setBrightness(progress / 100.0f);
+                  });
+
+                  root.addView(fxCard);
+                  addSpacer(root, 24);
+
+                  // --- MAIN START / STOP BUTTON ---
+                  final Button mainButton = new Button(this);
+                  mainButton.setText("▶  ЗАПУСТИТЬ МОНИТОРИНГ");
+                  mainButton.setTextSize(16f);
+                  mainButton.setAllCaps(false);
+                  mainButton.setTypeface(Typeface.DEFAULT_BOLD);
+                  mainButton.setTextColor(COLOR_ON_PRIMARY);
+                  mainButton.setBackground(createRoundedRect(COLOR_PRIMARY, 28, 0, 0));
+                  LinearLayout.LayoutParams btnParams = new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, dp(60));
+                  mainButton.setLayoutParams(btnParams);
+
+                  mainButton.setOnClickListener(v -> {
                       if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
                           requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1);
                           Toast.makeText(this, "Разрешите доступ к микрофону!", Toast.LENGTH_SHORT).show();
@@ -262,29 +688,137 @@ jobs:
                       if (isMonitoring) {
                           stopMonitoring();
                           isMonitoring = false;
-                          statusText.setText("Мониторинг ВЫКЛЮЧЕН");
-                          statusText.setTextColor(Color.WHITE);
-                          toggleButton.setText("Запустить");
+                          statusBadge.setText("● ОЖИДАНИЕ");
+                          statusBadge.setTextColor(COLOR_TEXT_MUTED);
+                          statusBadge.setBackground(createRoundedRect(COLOR_CARD_HIGHLIGHT, 50, 0, 0));
+                          mainButton.setText("▶  ЗАПУСТИТЬ МОНИТОРИНГ");
+                          mainButton.setTextColor(COLOR_ON_PRIMARY);
+                          mainButton.setBackground(createRoundedRect(COLOR_PRIMARY, 28, 0, 0));
                       } else {
                           if (startMonitoring()) {
                               isMonitoring = true;
-                              statusText.setText("Мониторинг АКТИВЕН");
-                              statusText.setTextColor(Color.parseColor("#4CAF50"));
-                              toggleButton.setText("Остановить");
+                              statusBadge.setText("● LIVE В ЭФИРЕ");
+                              statusBadge.setTextColor(Color.parseColor("#0A3818"));
+                              statusBadge.setBackground(createRoundedRect(COLOR_ACTIVE_GREEN, 50, 0, 0));
+                              mainButton.setText("⏹  ОСТАНОВИТЬ МОНИТОРИНГ");
+                              mainButton.setTextColor(COLOR_ON_STOP_RED);
+                              mainButton.setBackground(createRoundedRect(COLOR_STOP_RED, 28, 0, 0));
                           } else {
                               Toast.makeText(this, "Ошибка запуска аудиопотока", Toast.LENGTH_SHORT).show();
                           }
                       }
                   });
 
-                  layout.addView(statusText);
-                  layout.addView(toggleButton);
-                  setContentView(layout);
+                  root.addView(mainButton);
+
+                  scrollView.addView(root);
+                  setContentView(scrollView);
+
+                  // Start UI VU-meter loop
+                  uiHandler.post(levelUpdater);
+              }
+
+              private final Runnable levelUpdater = new Runnable() {
+                  @Override
+                  public void run() {
+                      if (isMonitoring) {
+                          float peak = getPeakLevel();
+                          int pct = Math.min(100, (int) (peak * 115.0f));
+                          levelBar.setProgress(pct);
+                          levelValueText.setText(pct + "%");
+                          if (pct > 85) {
+                              levelBar.setProgressTintList(ColorStateList.valueOf(COLOR_STOP_RED));
+                          } else if (pct > 45) {
+                              levelBar.setProgressTintList(ColorStateList.valueOf(COLOR_ACTIVE_GREEN));
+                          } else {
+                              levelBar.setProgressTintList(ColorStateList.valueOf(COLOR_PRIMARY));
+                          }
+                      } else {
+                          levelBar.setProgress(0);
+                          levelValueText.setText("0%");
+                      }
+                      uiHandler.postDelayed(this, 35);
+                  }
+              };
+
+              private void selectHarmonyChip(int index) {
+                  selectedHarmony = index;
+                  setHarmonyMode(index);
+                  for (int i = 0; i < harmonyButtons.length; i++) {
+                      if (i == index) {
+                          harmonyButtons[i].setBackground(createRoundedRect(COLOR_PRIMARY, 20, 0, 0));
+                          harmonyButtons[i].setTextColor(COLOR_ON_PRIMARY);
+                          harmonyButtons[i].setTypeface(Typeface.DEFAULT_BOLD);
+                      } else {
+                          harmonyButtons[i].setBackground(createRoundedRect(COLOR_CARD_HIGHLIGHT, 20, Color.parseColor("#49454F"), 1));
+                          harmonyButtons[i].setTextColor(COLOR_TEXT);
+                          harmonyButtons[i].setTypeface(Typeface.DEFAULT);
+                      }
+                  }
+              }
+
+              private LinearLayout createCard() {
+                  LinearLayout card = new LinearLayout(this);
+                  card.setOrientation(LinearLayout.VERTICAL);
+                  card.setPadding(dp(18), dp(18), dp(18), dp(18));
+                  card.setBackground(createRoundedRect(COLOR_CARD, 24, Color.parseColor("#2B2930"), 1));
+                  return card;
+              }
+
+              private void addSpacer(LinearLayout parent, int heightDp) {
+                  View v = new View(this);
+                  v.setLayoutParams(new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(heightDp)));
+                  parent.addView(v);
+              }
+
+              private interface SliderCallback {
+                  void onValueChanged(int progress);
+              }
+
+              private void addSlider(LinearLayout parent, String label, int initial, int max, final String suffix, final SliderCallback callback) {
+                  LinearLayout row = new LinearLayout(this);
+                  row.setOrientation(LinearLayout.HORIZONTAL);
+
+                  TextView title = new TextView(this);
+                  title.setText(label);
+                  title.setTextColor(COLOR_TEXT);
+                  title.setTextSize(14f);
+                  title.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+                  final TextView valText = new TextView(this);
+                  valText.setText(initial + suffix);
+                  valText.setTextColor(COLOR_PRIMARY);
+                  valText.setTextSize(14f);
+                  valText.setTypeface(Typeface.DEFAULT_BOLD);
+
+                  row.addView(title);
+                  row.addView(valText);
+                  parent.addView(row);
+
+                  addSpacer(parent, 6);
+
+                  SeekBar seekBar = new SeekBar(this);
+                  seekBar.setMax(max);
+                  seekBar.setProgress(initial);
+                  seekBar.setProgressTintList(ColorStateList.valueOf(COLOR_PRIMARY));
+                  seekBar.setThumbTintList(ColorStateList.valueOf(COLOR_PRIMARY));
+                  seekBar.setProgressBackgroundTintList(ColorStateList.valueOf(COLOR_CARD_HIGHLIGHT));
+                  seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      @Override
+                      public void onProgressChanged(SeekBar sb, int progress, boolean fromUser) {
+                          valText.setText(progress + suffix);
+                          callback.onValueChanged(progress);
+                      }
+                      @Override public void onStartTrackingTouch(SeekBar sb) {}
+                      @Override public void onStopTrackingTouch(SeekBar sb) {}
+                  });
+                  parent.addView(seekBar);
               }
 
               @Override
               protected void onDestroy() {
                   super.onDestroy();
+                  uiHandler.removeCallbacks(levelUpdater);
                   if (isMonitoring) {
                       stopMonitoring();
                       isMonitoring = false;
@@ -299,5 +833,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: LiveMonitor-APK
+          name: VocalStudioPro-APK
           path: app/build/outputs/apk/debug/app-debug.apk
